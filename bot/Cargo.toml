@@ -1,0 +1,26 @@
+[package]
+name = "mystbot"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+clokwerk = "0.4.0"
+grammers-client = { git = "https://github.com/Lonami/grammers" }
+log = "0.4.27"
+reqwest = "0.12.15"
+serde_json = "1.0.140"
+simple_logger = "5.0.0"
+sqlx = { version = "0.8.3", features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1.44.2", features = ["macros", "rt", "rt-multi-thread"] }
+mystbot-core = { version = "0.1.0", path = "../core" }
+track24 = { version = "0.1.0", path = "../track24" }
+lucida-api = { version = "0.1.0", path = "../lucida/api" }
+dashmap = "6.1.0"
+sha1 = "0.10.6"
+hex = "0.4.3"
+itertools = "0.14.0"
+futures = "0.3.31"
+fruityger = { version = "0.1.0", path = "../fruityger" }
+bytes = "1.10.1"
+tempfile = "3.20.0"

@@ -1,0 +1,9 @@
+[submodule "lucida"]
+	path = lucida
+	url = https://github.com/notmyst33d/lucida-rs
+[submodule "fruityger"]
+	path = fruityger
+	url = https://github.com/notmyst33d/fruityger
+[submodule "track24"]
+	path = track24
+	url = https://github.com/notmyst33d/track24

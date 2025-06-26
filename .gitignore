@@ -1,0 +1,4 @@
+/target
+/bot/cache
+*.session
+*.db
