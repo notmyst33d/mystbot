@@ -5,9 +5,9 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
+clokwerk = "0.4.0"
 dashmap = "6.1.0"
 futures = "0.3.31"
 grammers-client = { git = "https://github.com/Lonami/grammers", features = ["markdown"] }
-log = "0.4.27"
 regex = "1.11.1"
 tokio = "1.44.2"

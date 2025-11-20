@@ -1,114 +1,120 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025 Myst33d <myst33d@gmail.com>
 
-use fruityger::{Metadata, Track};
-use mystbot_core::client_wrapper::ClientWrapper;
+use crate::{
+    AppContext,
+    audio_common::{self, DownloadedTrack},
+    context_ext::ContextExt,
+};
+use fruityger::{Metadata, Track, format::Format};
 use tokio::sync::mpsc;
 
-use crate::{
-    AppState,
-    cached_file::{CachedFile, get_cached_file, upload_cached_file},
-};
+#[derive(Clone)]
+pub enum ModuleType {
+    Yandex,
+    HifiQobuz,
+}
+
+impl TryFrom<&str> for ModuleType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "hifi" | "qobuz" => Ok(ModuleType::HifiQobuz),
+            "yandex" => Ok(ModuleType::Yandex),
+            _ => Err(anyhow::anyhow!("cannot convert `{value}` to ModuleType")),
+        }
+    }
+}
+
+impl ModuleType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ModuleType::Yandex => "yandex",
+            ModuleType::HifiQobuz => "hifi",
+        }
+    }
+}
 
 pub async fn download_track(
-    client: ClientWrapper,
-    state: AppState,
-    track: Track,
+    context: AppContext,
+    (track, module_type): (Track, ModuleType),
     tx: mpsc::Sender<String>,
     refresh_cache: bool,
-) -> Option<(CachedFile, CachedFile)> {
-    let workdir = tempfile::tempdir().ok()?;
+) -> anyhow::Result<DownloadedTrack> {
+    let workdir = tempfile::tempdir()?;
     let filename_temp = format!("{} - {}_temp", track.artists[0].name, track.title);
     let filename = format!("{} - {}", track.artists[0].name, track.title);
 
-    let get_audio = || async {
-        tx.send("Скачиваем аудио".to_string()).await.ok()?;
+    audio_common::get_downloaded_track(
+        context,
+        refresh_cache,
+        track.url.clone(),
+        Some(track.cover_url.clone()),
+        |context| async move {
+            tx.send("Скачиваем аудио".to_string()).await?;
 
-        let mut audio = state
-            .read()
-            .await
-            .fruityger_client
-            .download(workdir.path(), &filename_temp, &track.url)
-            .await
-            .ok()?;
+            let stream = match module_type {
+                ModuleType::Yandex => {
+                    context
+                        .state
+                        .read()
+                        .await
+                        .fruityger_clients
+                        .yandex
+                        .clone()
+                        .ok_or(anyhow::anyhow!("module not active"))?
+                        .get_stream(&track.id)
+                        .await?
+                }
+                ModuleType::HifiQobuz => {
+                    context
+                        .state
+                        .read()
+                        .await
+                        .fruityger_clients
+                        .hifi
+                        .clone()
+                        .ok_or(anyhow::anyhow!("module not active"))?
+                        .get_stream(&track.id)
+                        .await?
+                }
+            };
+            let format = stream.format.clone();
 
-        tx.send("Скачиваем обложку".to_string()).await.ok()?;
+            let mut track_path =
+                fruityger::save_audio_stream(stream, workdir.path(), &filename_temp).await?;
 
-        let cover = state
-            .read()
-            .await
-            .fruityger_client
-            .download_cover(workdir.path(), "cover", &track.cover_url)
-            .await
-            .ok()?;
+            tx.send("Скачиваем обложку".to_string()).await?;
 
-        tx.send("Добавляем метаданные".to_string()).await.ok()?;
-
-        audio = state
-            .read()
-            .await
-            .fruityger_client
-            .remux(
+            let cover_path = fruityger::save_cover(
+                reqwest::get(&track.cover_url).await?,
                 workdir.path(),
+                "cover",
+            )
+            .await?;
+
+            tx.send("Добавляем метаданные".to_string()).await?;
+
+            track_path = fruityger::remux(
+                workdir.path(),
+                &track_path,
+                Some(&cover_path.0),
+                format.clone(),
                 &filename,
-                audio,
-                &cover.1,
                 Metadata {
                     title: track.title.clone(),
                     artist: track.artists[0].name.clone(),
                     ..Default::default()
                 },
-            )
-            .ok()?;
+            )?;
 
-        tx.send("Загружаем файл".to_string()).await.ok()?;
+            tx.send("Загружаем файл".to_string()).await?;
 
-        upload_cached_file(
-            client.clone(),
-            &state.read().await.cache_dir,
-            &audio.1,
-            &track.url,
-            audio.0.mime_type(),
-        )
-        .await
-    };
-
-    let audio = if refresh_cache {
-        get_audio().await?
-    } else {
-        match get_cached_file(&state.read().await.cache_dir, &track.url).await {
-            Some(audio) => audio,
-            None => get_audio().await?,
-        }
-    };
-
-    let artwork = {
-        let get_thumb = || async {
-            let cover = state
-                .read()
+            context
+                .upload_cached_file(&track.url, &track_path, format.mime_type())
                 .await
-                .fruityger_client
-                .download_cover(workdir.path(), "cover", &track.cover_url)
-                .await
-                .ok()?;
-            upload_cached_file(
-                client,
-                &state.read().await.cache_dir,
-                &cover.1,
-                &track.cover_url,
-                cover.0.mime_type(),
-            )
-            .await
-        };
-        if refresh_cache {
-            get_thumb().await?
-        } else {
-            match get_cached_file(&state.read().await.cache_dir, &track.cover_url).await {
-                Some(artwork) => artwork,
-                None => get_thumb().await?,
-            }
-        }
-    };
-
-    Some((audio, artwork))
+        },
+    )
+    .await
 }

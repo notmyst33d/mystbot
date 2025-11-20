@@ -1,63 +1,70 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025 Myst33d <myst33d@gmail.com>
 
-pub mod client_wrapper;
-pub mod error;
 pub mod inline_audio;
+pub mod inline_message_ext;
 pub mod inline_query;
 
+use clokwerk::{AsyncScheduler, Interval};
 use dashmap::DashMap;
 use futures::future::BoxFuture;
 use grammers_client::{
-    Config, Update,
+    Client, Config, Update,
     client::bots::AuthorizationError,
     session::Session,
     types::{CallbackQuery, InlineQuery, InlineSend, Message, User},
 };
-use log::debug;
 use regex::Regex;
-use std::sync::Arc;
-use tokio::task;
+use std::{sync::Arc, time::Duration};
 
-use crate::{
-    client_wrapper::ClientWrapper,
-    error::{Error, WithMessage},
-};
+type Fut = BoxFuture<'static, ()>;
+type MessageCallback<State> = fn(Context<State>, Message) -> Fut;
+type CallbackQueryCallback<State> = fn(Context<State>, CallbackQuery) -> Fut;
+type InlineQueryCallback<State> = fn(Context<State>, InlineQuery) -> Fut;
+type InlineSendCallback<State> = fn(Context<State>, InlineSend) -> Fut;
+type ContextCallback<State> = fn(Context<State>) -> Fut;
 
-type Fut = BoxFuture<'static, Result<(), Error>>;
-type FutBool = BoxFuture<'static, Result<bool, Error>>;
+type ComposeModuleFunc<State> = fn(MystbotCore<State>, &mut AsyncScheduler) -> MystbotCore<State>;
 
 struct CommandData<State> {
     regex: Regex,
-    func: Box<fn(ClientWrapper, Message, State) -> Fut>,
+    func: Box<MessageCallback<State>>,
 }
 
-pub struct MystbotCore<State: Send + Sync> {
+#[derive(Clone)]
+pub struct Context<State> {
+    pub client: Client,
+    pub state: State,
+}
+
+impl<State> Context<State> {
+    pub fn new(client: Client, state: State) -> Self {
+        Context { client, state }
+    }
+}
+
+pub struct MystbotCore<State> {
     me: User,
     commands: DashMap<String, CommandData<State>>,
-    pub state: State,
-    callback_query: Option<fn(ClientWrapper, CallbackQuery, State) -> Fut>,
-    inline_query: Option<fn(ClientWrapper, InlineQuery, State) -> Fut>,
-    inline_send: Option<fn(ClientWrapper, InlineSend, State) -> Fut>,
-    before_command_hook: Option<fn(ClientWrapper, Message, State) -> FutBool>,
-    after_command_hook: Option<fn(ClientWrapper, Message, State) -> Fut>,
+    client: Client,
+    state: State,
+    callback_query: Option<CallbackQueryCallback<State>>,
+    inline_query: Option<InlineQueryCallback<State>>,
+    inline_send: Option<InlineSendCallback<State>>,
 }
 
-impl<State: Send + Sync + 'static> MystbotCore<State> {
+impl<State: Send + Sync + Clone + 'static> MystbotCore<State> {
     pub async fn connect(
         bot_token: &str,
+        api_id: i32,
+        api_hash: &str,
         state: State,
-    ) -> Result<(ClientWrapper, Self), AuthorizationError> {
+    ) -> Result<(Client, Self), AuthorizationError> {
         let client = grammers_client::Client::connect(Config {
             session: Session::load_file_or_create("teobot.session")
                 .expect("failed to load session"),
-            api_id: std::env::var("API_ID")
-                .expect("api_id not found")
-                .parse()
-                .expect("failed to parse api_id"),
-            api_hash: std::env::var("API_HASH")
-                .expect("api_hash not found")
-                .to_string(),
+            api_id,
+            api_hash: api_hash.to_owned(),
             params: Default::default(),
         })
         .await?;
@@ -70,26 +77,21 @@ impl<State: Send + Sync + 'static> MystbotCore<State> {
         let me = client.get_me().await.unwrap();
 
         Ok((
-            ClientWrapper(client),
+            client.clone(),
             Self {
                 me,
-                state,
                 commands: DashMap::new(),
+                client,
+                state,
                 callback_query: None,
                 inline_query: None,
                 inline_send: None,
-                before_command_hook: None,
-                after_command_hook: None,
             },
         ))
     }
 
     /// Add new command to handler list
-    pub fn add_command(
-        &mut self,
-        command: impl Into<String>,
-        handler: fn(ClientWrapper, Message, State) -> Fut,
-    ) {
+    pub fn add_command(&mut self, command: impl Into<String>, handler: MessageCallback<State>) {
         let command = command.into();
         self.commands.insert(
             command.clone(),
@@ -105,47 +107,62 @@ impl<State: Send + Sync + 'static> MystbotCore<State> {
         );
     }
 
-    /// Add callback query handler, there can be only one handler, if you call this function again with another handler it will replace the old one
-    pub fn add_callback_query(&mut self, handler: fn(ClientWrapper, CallbackQuery, State) -> Fut) {
+    /// Set callback query handler, there can be only one handler, if you call this function again with another handler it will replace the old one
+    pub fn set_callback_query(&mut self, handler: CallbackQueryCallback<State>) {
         self.callback_query = Some(handler);
     }
 
-    /// Add inline query handler, there can be only one handler, if you call this function again with another handler it will replace the old one
-    pub fn add_inline_query(&mut self, handler: fn(ClientWrapper, InlineQuery, State) -> Fut) {
+    /// Set inline query handler, there can be only one handler, if you call this function again with another handler it will replace the old one
+    pub fn set_inline_query(&mut self, handler: InlineQueryCallback<State>) {
         self.inline_query = Some(handler);
     }
 
-    /// Add inline send handler, there can be only one handler, if you call this function again with another handler it will replace the old one
-    pub fn add_inline_send(&mut self, handler: fn(ClientWrapper, InlineSend, State) -> Fut) {
+    /// Set inline send handler, there can be only one handler, if you call this function again with another handler it will replace the old one
+    pub fn set_inline_send(&mut self, handler: InlineSendCallback<State>) {
         self.inline_send = Some(handler);
     }
 
-    /// Add handler which executes after the command handler
-    pub fn add_after_command_hook(&mut self, handler: fn(ClientWrapper, Message, State) -> Fut) {
-        self.after_command_hook = Some(handler);
+    /// Composable module registration
+    pub fn register(self, func: ComposeModuleFunc<State>, scheduler: &mut AsyncScheduler) -> Self {
+        func(self, scheduler)
     }
 
-    /// Add handler which executes before the command handler, the return value indicates if the command handler should run or not
-    pub fn add_before_command_hook(
-        &mut self,
-        handler: fn(ClientWrapper, Message, State) -> FutBool,
+    /// Schedule a function to run on intervals
+    pub fn schedule_every(
+        &self,
+        scheduler: &mut AsyncScheduler,
+        ival: Interval,
+        func: ContextCallback<State>,
     ) {
-        self.before_command_hook = Some(handler);
+        let context = Context::new(self.client.clone(), self.state.clone());
+        scheduler.every(ival).run(move || {
+            let context = context.clone();
+            async move {
+                let _ = func(context).await;
+            }
+        });
     }
 }
 
 /// Start bot
 pub async fn run<S: Sync + Send + Clone + 'static>(
-    client: ClientWrapper,
     app: Arc<MystbotCore<S>>,
+    mut scheduler: AsyncScheduler,
 ) {
+    tokio::spawn(async move {
+        loop {
+            scheduler.run_pending().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
     loop {
-        let client = client.clone();
         let app = app.clone();
-        match client.next_update().await.unwrap() {
+        let context = Context::new(app.client.clone(), app.state.clone());
+
+        match app.client.next_update().await.unwrap() {
             Update::NewMessage(message) => {
-                debug!("new command thread");
-                task::spawn(async move {
+                tokio::spawn(async move {
                     if message.outgoing() {
                         return;
                     }
@@ -157,71 +174,30 @@ pub async fn run<S: Sync + Send + Clone + 'static>(
                             if caps[1][1..] != *multi.key() {
                                 continue;
                             }
-                            if let Some(func) = app.before_command_hook {
-                                if !func(client.clone(), message.clone(), app.state.clone())
-                                    .await
-                                    .unwrap_or_default()
-                                {
-                                    continue;
-                                }
-                            }
-                            match (multi.func)(client.clone(), message.clone(), app.state.clone())
-                                .await
-                            {
-                                Ok(_) => {
-                                    if let Some(func) = app.after_command_hook {
-                                        let _ =
-                                            func(client.clone(), message, app.state.clone()).await;
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!("handler error: {e}");
-                                    if let Some(m) = e.input_message() {
-                                        message.reply(m).await.unwrap();
-                                    }
-                                }
-                            };
+                            (multi.func)(context.clone(), message.clone()).await;
                             break;
                         }
                     }
                 });
             }
             Update::CallbackQuery(query) => {
-                debug!("new callback query thread");
-                task::spawn(async move {
+                tokio::spawn(async move {
                     if let Some(func) = app.callback_query {
-                        match func(client, query, app.state.clone()).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                debug!("handler error: {e}");
-                            }
-                        };
+                        let _ = func(context.clone(), query).await;
                     }
                 });
             }
             Update::InlineQuery(query) => {
-                debug!("new inline query thread");
-                task::spawn(async move {
+                tokio::spawn(async move {
                     if let Some(func) = app.inline_query {
-                        match func(client, query, app.state.clone()).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                debug!("handler error: {e}");
-                            }
-                        };
+                        let _ = func(context.clone(), query).await;
                     }
                 });
             }
             Update::InlineSend(send) => {
-                debug!("new inline send thread");
-                task::spawn(async move {
+                tokio::spawn(async move {
                     if let Some(func) = app.inline_send {
-                        match func(client, send, app.state.clone()).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                debug!("handler error: {e}");
-                            }
-                        };
+                        let _ = func(context.clone(), send).await;
                     }
                 });
             }

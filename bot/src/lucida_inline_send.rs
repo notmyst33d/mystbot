@@ -1,113 +1,41 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025 Myst33d <myst33d@gmail.com>
 
-use grammers_client::{
-    grammers_tl_types,
-    types::{Attribute, InlineSend},
-};
-use mystbot_core::{client_wrapper::ClientWrapper, error::Error};
-use std::time::Duration;
-use tokio::{sync::mpsc, task};
+use crate::{AppContext, audio_common, lucida_common};
+use grammers_client::types::InlineSend;
+use mystbot_core::inline_message_ext::InlineMessageExt;
 
-use crate::{AppState, cached_file::CachedFile, lucida_common};
-
-pub async fn run(
-    client: ClientWrapper,
-    send: InlineSend,
-    state: AppState,
-    args: Vec<String>,
-) -> Result<(), Error> {
+pub async fn run(context: AppContext, send: InlineSend, args: Vec<String>) -> anyhow::Result<()> {
     let message_id = send.message_id().unwrap();
-    let Some(track) = state
+
+    let Some(track) = context
+        .state
         .read()
         .await
         .lucida_cache
-        .view(&args[0], |_, v| v.clone())
+        .get(&args[0])
+        .map(|v| v.value().clone())
     else {
-        client
-            .edit_inline_message(
+        context
+            .client
+            .edit_inline_message_ext(
                 message_id,
                 "Устаревшее сообщение",
-                Some("Скачиваем...".to_string()),
+                Some("Скачиваем..."),
                 None,
             )
             .await?;
         return Ok(());
     };
 
-    let (tx, mut rx) = mpsc::channel(16);
-    {
-        let message_id = message_id.clone();
-        let client = client.clone();
-        task::spawn(async move {
-            while let Some(m) = rx.recv().await {
-                let _ = client
-                    .edit_inline_message(
-                        message_id.clone(),
-                        m,
-                        Some("Скачиваем...".to_string()),
-                        None,
-                    )
-                    .await;
-            }
-        });
-    }
-
-    let send = |audio: CachedFile, artwork: Option<CachedFile>| async {
-        client
-            .edit_inline_message(
-                message_id.clone(),
-                "",
-                None,
-                Some(grammers_tl_types::enums::InputMedia::UploadedDocument(
-                    grammers_tl_types::types::InputMediaUploadedDocument {
-                        nosound_video: false,
-                        force_file: false,
-                        spoiler: false,
-                        file: audio.0.raw,
-                        thumb: artwork.map(|t| t.0.raw),
-                        mime_type: audio.1,
-                        attributes: vec![
-                            Attribute::Audio {
-                                duration: Duration::from_millis(track.duration_ms as u64),
-                                title: Some(track.title.clone()),
-                                performer: Some(track.artists[0].name.clone()),
-                            }
-                            .into(),
-                        ],
-                        video_cover: None,
-                        video_timestamp: None,
-                        stickers: None,
-                        ttl_seconds: None,
-                    },
-                )),
-            )
-            .await
-    };
-
-    let mut sent = false;
-    for i in 0..2 {
-        if let Some((audio, artwork)) = lucida_common::download_track(
-            client.clone(),
-            state.clone(),
-            track.clone(),
-            tx.clone(),
-            i == 1,
-        )
-        .await
-        {
-            if send(audio, artwork).await.unwrap_or_default() {
-                sent = true;
-                break;
-            }
-        };
-    }
-
-    if !sent {
-        client
-            .edit_inline_message(message_id.clone(), "Не удалось скачать трек", None, None)
-            .await?;
-    }
-
-    Ok(())
+    audio_common::retry_send_inline_with_progress(
+        context.clone(),
+        message_id.clone(),
+        track.title.clone(),
+        track.artists[0].name.clone(),
+        track.duration_ms as u64,
+        track.clone(),
+        lucida_common::download_track,
+    )
+    .await
 }
