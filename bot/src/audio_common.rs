@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025 Myst33d <myst33d@gmail.com>
+
 use crate::{AppContext, CachedFile, context_ext::ContextExt};
 use fruityger::format::Format;
 use grammers_client::grammers_tl_types::enums::InputBotInlineMessageId;
